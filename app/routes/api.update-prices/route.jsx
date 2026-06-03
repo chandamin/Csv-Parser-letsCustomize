@@ -3,15 +3,10 @@ import { authenticate } from "../../shopify.server";
 
 function normalizeHeader(row, header) {
   if (!header) return undefined;
-
   const target = String(header).trim().toLowerCase();
-
   for (const key of Object.keys(row || {})) {
-    if (String(key).trim().toLowerCase() === target) {
-      return key;
-    }
+    if (String(key).trim().toLowerCase() === target) return key;
   }
-
   return undefined;
 }
 
@@ -19,47 +14,28 @@ export const action = async ({ request }) => {
   const { rows, skuHeader, priceHeader } = await request.json();
 
   if (!Array.isArray(rows) || rows.length === 0) {
-    return json(
-      {
-        ok: false,
-        error: "No rows provided",
-      },
-      { status: 400 }
-    );
+    return json({ ok: false, error: "No rows provided" }, { status: 400 });
   }
 
   const { admin } = await authenticate.admin(request);
 
   let updated = 0;
   let failed = 0;
-  const details = [];
+  const results = [];
 
   for (const [index, row] of rows.entries()) {
     try {
-      const skuKey =
-        normalizeHeader(row, skuHeader) || skuHeader;
-
-      let priceKey =
-        normalizeHeader(row, priceHeader) || priceHeader;
+      const skuKey = normalizeHeader(row, skuHeader) || skuHeader;
+      let priceKey = normalizeHeader(row, priceHeader) || priceHeader;
 
       if (row?.[priceKey] === undefined) {
         const commonPriceHeaders = [
-          "price",
-          "product price",
-          "recommended price",
-          "variant price",
-          "new price",
-          "sale price",
-          "compare at price",
+          "price", "product price", "recommended price",
+          "variant price", "new price", "sale price", "compare at price",
         ];
-
         for (const h of commonPriceHeaders) {
           const k = normalizeHeader(row, h);
-
-          if (k && row?.[k] !== undefined) {
-            priceKey = k;
-            break;
-          }
+          if (k && row?.[k] !== undefined) { priceKey = k; break; }
         }
       }
 
@@ -68,35 +44,27 @@ export const action = async ({ request }) => {
 
       if (!sku) {
         failed++;
-
-        details.push({
-          rowIndex: index,
-          sku: null,
-          status: "failed",
-          reason: "Missing SKU",
+        results.push({
+          sku: "(empty)",
+          success: false,
+          detail: `Row ${index + 1}: SKU field is empty`,
+          reason: "error",
         });
-
         continue;
       }
 
-      const price = Number(
-        String(priceRaw ?? "").replace(/[^0-9.\-]/g, "")
-      );
+      const price = Number(String(priceRaw ?? "").replace(/[^0-9.\-]/g, ""));
 
       if (!Number.isFinite(price)) {
         failed++;
-
-        details.push({
-          rowIndex: index,
+        results.push({
           sku,
-          status: "failed",
-          reason: "Invalid price",
+          success: false,
+          detail: `Invalid price value: "${priceRaw}"`,
+          reason: "error",
         });
-
         continue;
       }
-
-      console.log("Searching SKU:", sku);
 
       const variantResponse = await admin.graphql(
         `#graphql
@@ -106,54 +74,32 @@ export const action = async ({ request }) => {
               node {
                 id
                 sku
-                product {
-                  id
-                }
+                price
+                product { id }
               }
             }
           }
         }`,
-        {
-          variables: {
-            query: `sku:${sku}`,
-          },
-        }
+        { variables: { query: `sku:${sku}` } }
       );
 
       const variantData = await variantResponse.json();
-
-      console.log(
-        "Variant Search Result:",
-        JSON.stringify(variantData, null, 2)
-      );
-
-      const variantNode =
-        variantData?.data?.productVariants?.edges?.[0]?.node;
+      const variantNode = variantData?.data?.productVariants?.edges?.[0]?.node;
 
       if (!variantNode?.id) {
         failed++;
-
-        details.push({
-          rowIndex: index,
+        results.push({
           sku,
-          status: "failed",
-          reason: "SKU not found",
+          success: false,
+          detail: "No matching product variant found in Shopify",
+          reason: "not_found",
         });
-
         continue;
       }
 
       const variantId = variantNode.id;
       const productId = variantNode.product.id;
-
-      console.log(
-        "Updating Variant:",
-        variantId,
-        "Product:",
-        productId,
-        "Price:",
-        price
-      );
+      const oldPrice  = variantNode.price;
 
       const updateResponse = await admin.graphql(
         `#graphql
@@ -161,77 +107,48 @@ export const action = async ({ request }) => {
           $productId: ID!,
           $variants: [ProductVariantsBulkInput!]!
         ) {
-          productVariantsBulkUpdate(
-            productId: $productId
-            variants: $variants
-          ) {
-            productVariants {
-              id
-              sku
-              price
-            }
-            userErrors {
-              field
-              message
-            }
+          productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+            productVariants { id sku price }
+            userErrors { field message }
           }
         }`,
         {
           variables: {
             productId,
-            variants: [
-              {
-                id: variantId,
-                price: String(price),
-              },
-            ],
+            variants: [{ id: variantId, price: String(price) }],
           },
         }
       );
 
       const updateData = await updateResponse.json();
-
-      console.log(
-        "Update Result:",
-        JSON.stringify(updateData, null, 2)
-      );
-
-      const userErrors =
-        updateData?.data?.productVariantsBulkUpdate?.userErrors ??
-        [];
+      const userErrors = updateData?.data?.productVariantsBulkUpdate?.userErrors ?? [];
 
       if (userErrors.length > 0) {
         failed++;
-
-        details.push({
-          rowIndex: index,
+        results.push({
           sku,
-          status: "failed",
-          reason: userErrors
-            .map((e) => e.message)
-            .join("; "),
+          success: false,
+          detail: userErrors.map((e) => e.message).join("; "),
+          reason: "error",
         });
-
         continue;
       }
 
       updated++;
-
-      details.push({
-        rowIndex: index,
+      results.push({
         sku,
-        status: "updated",
-        price,
+        success: true,
+        detail: `Price updated: $${Number(oldPrice).toFixed(2)} → $${price.toFixed(2)}`,
       });
+
     } catch (err) {
       console.error(err);
-
       failed++;
-
-      details.push({
-        rowIndex: index,
-        status: "failed",
-        reason: err?.message || String(err),
+      results.push({
+        sku: row?.[normalizeHeader(row, skuHeader) || skuHeader] || "(unknown)",
+        success: false,
+        detail: err?.message || String(err),
+        reason: "error",
       });
     }
   }
@@ -241,6 +158,6 @@ export const action = async ({ request }) => {
     updatedCount: updated,
     failedCount: failed,
     totalCount: updated + failed,
-    details,
+    results, // ← frontend reads this for the modal
   });
 };
