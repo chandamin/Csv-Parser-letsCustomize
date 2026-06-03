@@ -254,7 +254,7 @@ export default function Index() {
       <Page title="CSV Import Tool">
         <BlockStack gap="400">
 
-          {/* <Button onClick={onTestSync} disabled={loading}>Test CSV Sync</Button> */}
+          <Button onClick={onTestSync} disabled={loading}>Test CSV Sync</Button>
 
           <Card>
             <BlockStack gap="400">

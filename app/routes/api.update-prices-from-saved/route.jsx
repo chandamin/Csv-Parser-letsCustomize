@@ -210,6 +210,7 @@ export const action = async ({ request }) => {
         }
 
         updated++;
+        console.log(`✅ SUCCESS | SKU: ${sku} | Price: ${price}`);
         details.push({
           rowIndex: index,
           sku,
