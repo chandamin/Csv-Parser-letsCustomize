@@ -1,8 +1,8 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "29fa276b3481ffe7496b77e628a3ca5c"
-name = "Csv_parser"
-application_url = "https://escape-buddy-compliant-latex.trycloudflare.com"
+name = "CSV Sync"
+application_url = "https://letscustom.kaswebtechsolutions.com/"
 embedded = true
 
 [build]
@@ -24,4 +24,4 @@ api_version = "2026-07"
 scopes = "read_products,write_products,read_inventory,write_inventory,read_locations"
 
 [auth]
-redirect_urls = [ "https://escape-buddy-compliant-latex.trycloudflare.com/api/auth" ]
+redirect_urls = [ "https://letscustom.kaswebtechsolutions.com/api/auth" ]
