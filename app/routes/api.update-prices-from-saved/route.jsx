@@ -37,9 +37,13 @@ function parseCsvToRows(csvText) {
 
 export const action = async ({ request }) => {
   try {
+
+     console.log("🚀 PRICE SYNC STARTED");
     // ✅ FIXED: single authentication call
     const { admin, session } = await authenticate.admin(request);
     const shop = session?.shop;
+console.log("✅ AUTH SUCCESS");
+    console.log("SHOP:", session?.shop);
 
     if (!shop) {
       return json({ ok: false, error: "Missing shop session" }, { status: 400 });
@@ -52,6 +56,8 @@ export const action = async ({ request }) => {
     });
 
     const csvUrl = settings?.csvUrl;
+
+   console.log(`📄 CSV URL: ${csvUrl}`);
 
     if (!csvUrl) {
       return json(
@@ -99,6 +105,8 @@ export const action = async ({ request }) => {
     // 5. Loop rows
     for (const [index, row] of rows.entries()) {
       try {
+
+         console.log(`\n🔄 Processing Row ${index + 1}`);
         const skuKey = normalizeHeader(row, skuHeader) || skuHeader;
         let priceKey = normalizeHeader(row, priceHeader) || priceHeader;
 
@@ -124,7 +132,11 @@ export const action = async ({ request }) => {
         const sku = String(row?.[skuKey] ?? "").trim();
         const priceRaw = row?.[priceKey];
 
+        console.log(`📦 SKU: ${sku}`);
+console.log(`💰 Raw Price: ${priceRaw}`);
+
         if (!sku) {
+           console.error(`❌ SKU NOT FOUND: ${sku}`);
           failed++;
           details.push({ rowIndex: index, status: "failed", reason: "Missing SKU" });
           continue;
@@ -175,6 +187,10 @@ export const action = async ({ request }) => {
 
         // 7. Update price
         const updateRes = await admin.graphql(
+
+          console.log(
+  `🚀 Updating SKU ${sku} with Price ${price}`
+),
           `#graphql
           mutation ($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
             productVariantsBulkUpdate(productId: $productId, variants: $variants) {
@@ -236,6 +252,9 @@ export const action = async ({ request }) => {
       details,
     });
   } catch (err) {
+     console.error("💥 MAIN CATCH ERROR");
+  console.error(err);
+  console.error(err?.stack);
     return json(
       { ok: false, error: err?.message || String(err) },
       { status: 500 }
