@@ -47,6 +47,7 @@ console.log("✅ AUTH SUCCESS");
 
     if (!shop) {
       return json({ ok: false, error: "Missing shop session" }, { status: 400 });
+      console.log("❌ AUTH FAILED: No shop in session");
     }
 
     // 1. Get saved CSV URL
