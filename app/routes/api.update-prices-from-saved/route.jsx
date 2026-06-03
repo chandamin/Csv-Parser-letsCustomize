@@ -38,7 +38,7 @@ function parseCsvToRows(csvText) {
 export const action = async ({ request }) => {
   try {
 
-     console.log("🚀 PRICE SYNC STARTED");
+     console.log("🚀 PRICE SYNC STARTING");
     // ✅ FIXED: single authentication call
     const { admin, session } = await authenticate.admin(request);
     const shop = session?.shop;
