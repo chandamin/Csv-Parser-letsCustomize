@@ -5,7 +5,18 @@ import prisma from "../db.server";
 const API_VERSION = "2024-10";
 
 // --------------------
-// Parse CSV text -> rows
+// CSV header normalize
+// --------------------
+function normalizeHeader(row, header) {
+  if (!header) return undefined;
+  const target = String(header).trim().toLowerCase();
+  return Object.keys(row || {}).find(
+    (key) => String(key).trim().toLowerCase() === target
+  );
+}
+
+// --------------------
+// CSV text -> rows
 // --------------------
 function parseCsvToRows(csvText) {
   return new Promise((resolve, reject) => {
@@ -24,7 +35,7 @@ function parseCsvToRows(csvText) {
 }
 
 // --------------------
-// Refresh access token (agar expire ho)
+// Access token refresh
 // --------------------
 async function refreshAccessToken(shop, refreshToken) {
   const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
@@ -45,7 +56,7 @@ async function refreshAccessToken(shop, refreshToken) {
 }
 
 // --------------------
-// Valid offline session lo (refresh if expired)
+// Offline session (auto-refresh if expired)
 // --------------------
 async function getValidOfflineSession() {
   const offline = await prisma.session.findFirst({
@@ -65,12 +76,9 @@ async function getValidOfflineSession() {
 
   const shop = offline.id.replace("offline_", "");
 
-  // Expires nahi hai toh token non-expiring hai
   if (!offline.expires) return { shop, token: offline.accessToken };
 
-  const expiresAt = new Date(offline.expires).getTime();
-  const shouldRefresh = Date.now() >= expiresAt - 2 * 60 * 1000;
-
+  const shouldRefresh = Date.now() >= new Date(offline.expires).getTime() - 2 * 60 * 1000;
   if (!shouldRefresh) return { shop, token: offline.accessToken };
 
   if (!offline.refreshToken) {
@@ -98,9 +106,9 @@ async function getValidOfflineSession() {
 }
 
 // --------------------
-// GraphQL helper
+// GraphQL helper (with variables support)
 // --------------------
-async function graphqlForShop(shop, accessToken, query) {
+async function graphqlForShop(shop, accessToken, query, variables = {}) {
   const res = await fetch(
     `https://${shop}/admin/api/${API_VERSION}/graphql.json`,
     {
@@ -109,7 +117,7 @@ async function graphqlForShop(shop, accessToken, query) {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": accessToken,
       },
-      body: JSON.stringify({ query }),
+      body: JSON.stringify({ query, variables }),
     }
   );
 
@@ -120,23 +128,23 @@ async function graphqlForShop(shop, accessToken, query) {
 }
 
 // --------------------
-// Main sync function
+// Main sync
 // --------------------
 async function runOnce() {
   console.log("");
   console.log("========================================");
-  console.log("🚀 PRICING METAFIELD SYNC STARTED");
+  console.log("🚀 PRICE SYNC STARTED");
   console.log("🕒", new Date().toLocaleString());
   console.log("========================================");
 
-  // 1️⃣ AUTH - Prisma se offline session lo
+  // 1️⃣ AUTH
   const { shop, token } = await getValidOfflineSession();
 
   const ping = await graphqlForShop(shop, token, `query { shop { name } }`);
   console.log("✅ AUTH SUCCESS");
   console.log("🏪 Shop:", ping.shop.name);
 
-  // 2️⃣ CSV URL CHECK - AppSettings se lo
+  // 2️⃣ CSV URL - AppSettings se check karo
   const settings = await prisma.appSettings.findUnique({
     where: { shop },
     select: { csvUrl: true },
@@ -146,7 +154,7 @@ async function runOnce() {
   console.log("📄 CSV URL:", csvUrl || "NOT SET");
 
   if (!csvUrl) {
-    console.log("⚠️  CSV URL save nahi hai AppSettings mein — sync skip.");
+    console.log("⚠️  CSV URL save nahi hai — sync skip kiya.");
     console.log("========================================");
     return;
   }
@@ -158,176 +166,146 @@ async function runOnce() {
   }
 
   const csvText = await csvResponse.text();
-  const { rows } = await parseCsvToRows(csvText);
-  console.log("✅ CSV Loaded:", rows.length, "rows");
+  if (!csvText) throw new Error("CSV empty hai");
 
-  // 4️⃣ PRICE MAP banana (omnia product id => price)
-  const priceMap = {};
-  for (const row of rows) {
-    const csvProductId = String(row["product id"] || "").trim();
-    const price = row["recommended price"];
+  const { headers, rows } = await parseCsvToRows(csvText);
+  console.log(`📦 Total CSV rows: ${rows.length}`);
 
-    if (csvProductId && price) {
-      priceMap[csvProductId] = Number(String(price).replace(",", "."));
-    }
-  }
+  if (!rows.length) throw new Error("CSV mein koi rows nahi hain");
 
-  console.log("🧾 CSV Products mapped:", Object.keys(priceMap).length);
+  // 4️⃣ EXACT HEADERS (same as route code)
+  const skuHeader =
+    headers.find((h) => h?.toLowerCase() === "product sku") || "product sku";
 
-  // 5️⃣ SHOPIFY VARIANTS PAGINATION
-  let hasNextPage = true;
-  let cursor = null;
+  const priceHeader =
+    headers.find((h) => h?.toLowerCase() === "recommended price") ||
+    "recommended price";
+
+  console.log("🏷️  SKU Header:", skuHeader);
+  console.log("💰 Price Header:", priceHeader);
+
+  // 5️⃣ LOOP ROWS - exact same logic as route
   let updated = 0;
-  let scanned = 0;
+  let failed = 0;
 
-  while (hasNextPage) {
-    const data = await graphqlForShop(
-      shop,
-      token,
-      `{
-        productVariants(first: 100, after: ${cursor ? `"${cursor}"` : null}) {
-          pageInfo { hasNextPage endCursor }
-          edges {
-            node {
-              id
-              sku
-              omnia: metafield(namespace: "custom", key: "omnia") {
-                value
-              }
-              pricing: metafield(namespace: "custom", key: "pricing") {
-                value
-              }
-              pricingPremium: metafield(namespace: "custom", key: "pricing_premium") {
-                value
-              }
-              pricingCustomer: metafield(namespace: "custom", key: "pricing_customer") {
-                value
+  for (const [index, row] of rows.entries()) {
+    try {
+      console.log(`\n🔄 Row ${index + 1}/${rows.length}`);
+
+      const skuKey = normalizeHeader(row, skuHeader) || skuHeader;
+      let priceKey = normalizeHeader(row, priceHeader) || priceHeader;
+
+      // Fallback price column detection (same as route)
+      if (row?.[priceKey] === undefined) {
+        const fallbacks = ["price", "product price", "variant price", "sale price", "compare at price"];
+        for (const h of fallbacks) {
+          const k = normalizeHeader(row, h);
+          if (k && row?.[k] !== undefined) {
+            priceKey = k;
+            break;
+          }
+        }
+      }
+
+      const sku = String(row?.[skuKey] ?? "").trim();
+      const priceRaw = row?.[priceKey];
+
+      console.log(`📦 SKU: ${sku}`);
+      console.log(`💰 Raw Price: ${priceRaw}`);
+
+      if (!sku) {
+        console.log("❌ SKU empty — skip");
+        failed++;
+        continue;
+      }
+
+      const price = Number(String(priceRaw ?? "").replace(/[^0-9.\-]/g, ""));
+
+      if (!Number.isFinite(price)) {
+        console.log(`❌ Invalid price: ${priceRaw} — skip`);
+        failed++;
+        continue;
+      }
+
+      // 6️⃣ SKU SE VARIANT DHUNDO
+      const variantData = await graphqlForShop(
+        shop,
+        token,
+        `query ($query: String!) {
+          productVariants(first: 1, query: $query) {
+            edges {
+              node {
+                id
+                product { id }
               }
             }
           }
-        }
-      }`
-    );
+        }`,
+        { query: `sku:${sku}` }
+      );
 
-    const variants = data.productVariants.edges;
-    console.log("\n📦 Scanning batch:", variants.length, "variants");
+      const node = variantData?.productVariants?.edges?.[0]?.node;
 
-    for (const edge of variants) {
-      const variant = edge.node;
-      scanned++;
-
-      // Omnia metafield se product id lo
-      const omniaId = variant.omnia?.value?.trim();
-      if (!omniaId) continue;
-
-      // CSV mein match dhundo
-      const csvPrice = priceMap[omniaId];
-      if (csvPrice == null || Number.isNaN(csvPrice)) continue;
-
-      // 6️⃣ EXISTING METAFIELDS PARSE
-      let existing = {};
-      try { existing = variant.pricing?.value ? JSON.parse(variant.pricing.value) : {}; } catch { existing = {}; }
-
-      let existingPremium = {};
-      try { existingPremium = variant.pricingPremium?.value ? JSON.parse(variant.pricingPremium.value) : {}; } catch { existingPremium = {}; }
-
-      let existingCustomer = {};
-      try { existingCustomer = variant.pricingCustomer?.value ? JSON.parse(variant.pricingCustomer.value) : {}; } catch { existingCustomer = {}; }
-
-      // 7️⃣ PATCH BUILD - base_price kabhi mat chhuona
-      const buildPatch = (existing) => {
-        const patch = {
-          ...existing,
-          base_price: existing.base_price, // NEVER TOUCH
-          base_price_google: csvPrice,
-          base_price_idealo: csvPrice,
-        };
-
-        if (existing.tiered_price_google) {
-          patch.tiered_price_google = { ...existing.tiered_price_google, 1: csvPrice };
-        }
-        if (existing.tiered_price_idealo) {
-          patch.tiered_price_idealo = { ...existing.tiered_price_idealo, 1: csvPrice };
-        }
-        if (existing.tiered_price) {
-          patch.tiered_price = existing.tiered_price;
-        }
-
-        return patch;
-      };
-
-      const newPricing = buildPatch(existing);
-      const newPremiumPricing = buildPatch(existingPremium);
-      const newCustomerPricing = buildPatch(existingCustomer);
-
-      console.log(`💰 Updating SKU: ${variant.sku} | Omnia: ${omniaId} | Price: ${csvPrice}`);
-
-      try {
-        const mutationResult = await graphqlForShop(
-          shop,
-          token,
-          `mutation {
-            metafieldsSet(metafields: [
-              {
-                ownerId: "${variant.id}"
-                namespace: "custom"
-                key: "pricing"
-                type: "json"
-                value: "${JSON.stringify(newPricing).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"
-              },
-              {
-                ownerId: "${variant.id}"
-                namespace: "custom"
-                key: "pricing_premium"
-                type: "json"
-                value: "${JSON.stringify(newPremiumPricing).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"
-              },
-              {
-                ownerId: "${variant.id}"
-                namespace: "custom"
-                key: "pricing_customer"
-                type: "json"
-                value: "${JSON.stringify(newCustomerPricing).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"
-              }
-            ]) {
-              userErrors {
-                field
-                message
-              }
-            }
-          }`
-        );
-
-        const userErrors = mutationResult?.metafieldsSet?.userErrors || [];
-        if (userErrors.length > 0) {
-          console.log("❌ userErrors:", userErrors);
-        } else {
-          updated++;
-          console.log(`✅ SUCCESS | SKU=${variant.sku}`);
-        }
-
-        // Rate limit se bachne ke liye thoda wait
-        await new Promise((r) => setTimeout(r, 200));
-      } catch (err) {
-        console.log(`❌ Update failed for SKU ${variant.sku}:`, err.message);
+      if (!node?.id) {
+        console.log(`❌ SKU not found in Shopify: ${sku}`);
+        failed++;
+        continue;
       }
-    }
 
-    hasNextPage = data.productVariants.pageInfo.hasNextPage;
-    cursor = data.productVariants.pageInfo.endCursor;
+      // 7️⃣ PRICE UPDATE - productVariantsBulkUpdate (same as route)
+      console.log(`🚀 Updating SKU: ${sku} => Price: ${price}`);
+
+      const updateData = await graphqlForShop(
+        shop,
+        token,
+        `mutation ($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+          productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+            userErrors { message }
+          }
+        }`,
+        {
+          productId: node.product.id,
+          variants: [
+            {
+              id: node.id,
+              price: String(price),
+            },
+          ],
+        }
+      );
+
+      const errors = updateData?.productVariantsBulkUpdate?.userErrors || [];
+
+      if (errors.length > 0) {
+        console.log(`❌ userErrors for SKU ${sku}:`, errors.map((e) => e.message).join("; "));
+        failed++;
+        continue;
+      }
+
+      updated++;
+      console.log(`✅ SUCCESS | SKU=${sku} | Price=${price}`);
+
+      // Rate limit se bachne ke liye
+      await new Promise((r) => setTimeout(r, 200));
+
+    } catch (err) {
+      failed++;
+      console.log(`💥 Row ${index + 1} error:`, err?.message || err);
+    }
   }
 
   console.log("");
   console.log("========================================");
-  console.log("🎯 SYNC COMPLETE");
+  console.log("🎯 PRICE SYNC COMPLETE");
   console.log("========================================");
-  console.log(`✅ Updated  : ${updated}`);
-  console.log(`📦 Scanned  : ${scanned}`);
+  console.log(`✅ Updated : ${updated}`);
+  console.log(`❌ Failed  : ${failed}`);
+  console.log(`📦 Total   : ${rows.length}`);
   console.log("========================================");
 }
 
 // --------------------
-// Cron runner with lock
+// Cron lock runner
 // --------------------
 let isRunning = false;
 
@@ -350,11 +328,11 @@ async function runWithLock() {
   }
 }
 
-// Server start hote hi ek baar chala lo
+// Server start hote hi ek baar run
 runWithLock();
 
-// Phir har 3 minute pe
-console.log("🟢 PRICING SYNC CRON REGISTERED");
+// Har 3 minute pe cron
+console.log("🟢 PRICE SYNC CRON REGISTERED");
 console.log("⏰ Schedule: Har 3 minute");
 
 cron.schedule("*/3 * * * *", async () => {
